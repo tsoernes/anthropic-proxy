@@ -1,0 +1,62 @@
+[project]
+name = "anthropic-proxy"
+version = "0.1.0"
+description = "LiteLLM Anthropic to Azure Proxy with rich dashboard"
+requires-python = ">=3.11"
+dependencies = [
+    "litellm[proxy]>=1.40.0",
+    "python-dotenv>=1.0.1",
+    "rich>=13.7.0",
+    "azure-llm-toolkit>=0.2.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "basedpyright>=1.15.0",
+    "ruff>=0.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+fix = true
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "TRY", # tryceratops
+]
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+    "TRY003", # Allow long messages in exceptions
+]
+
+[tool.basedpyright]
+pythonVersion = "3.11"
+pythonPlatform = "All"
+typeCheckingMode = "basic"
+# Strict settings
+declareVars = true
+strictListInference = true
+strictDictionaryInference = true
+strictSetInference = true
+# Report settings
+reportMissingTypeStubs = "warning"
+reportOptionalMemberAccess = "error"
+reportOptionalSubscript = "error"
+reportOptionalCall = "error"
+reportOptionalIterable = "error"
+reportOptionalContextManager = "error"
+reportOptionalOperand = "error"

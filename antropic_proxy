@@ -1,0 +1,1497 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "litellm[proxy]>=1.40.0",
+#   "python-dotenv>=1.0.1",
+#   "rich>=13.7.0",
+#   "azure-llm-toolkit>=0.2.3"
+# ]
+# ///
+
+import argparse
+import atexit
+import logging
+import os
+import signal
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+
+import litellm
+
+# Avoid leaking parameters in logs and silence litellm noise.
+# Some litellm installations expose a global flag to drop request params — set it when available.
+try:
+    litellm.drop_params = True
+except Exception:
+    pass
+
+# Aggressive logging suppression: monkey-patch StreamHandler.emit to drop access logs
+# This catches GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS access log lines from uvicorn and other ASGI servers.
+_original_streamhandler_emit = logging.StreamHandler.emit
+
+def _silenced_emit(self, record):
+    msg = record.getMessage() if record else ""
+    # Suppress access log patterns like: INFO: 127.0.0.1:port - "METHOD /path HTTP/1.1" status
+    if any(x in msg for x in ('"GET ', '"POST ', '"PUT ', '"DELETE ', '"PATCH ', '"HEAD ', '"OPTIONS ')):
+        return
+    # Also suppress if logger name is a known access logger
+    if record.name in ("uvicorn.access", "uvicorn", "gunicorn.access", "hypercorn.access"):
+        return
+    return _original_streamhandler_emit(self, record)
+
+# Monkey-patch before uvicorn configures its loggers
+logging.StreamHandler.emit = _silenced_emit
+
+# Silence litellm logger (best-effort)
+try:
+    llog = logging.getLogger("litellm")
+    llog.setLevel(logging.CRITICAL)
+    llog.propagate = False
+    try:
+        llog.handlers.clear()
+    except Exception:
+        for h in list(llog.handlers):
+            try:
+                llog.removeHandler(h)
+            except Exception:
+                pass
+    llog.addHandler(logging.NullHandler())
+    llog.disabled = True
+except Exception:
+    pass
+
+
+# ------------------------------------------------
+# Request logging (optional debug log)
+# ------------------------------------------------
+
+_debug_logger: logging.Logger | None = None
+
+
+def _init_debug_logger() -> logging.Logger | None:
+    """Initialize a debug logger that writes sanitized request logs to a file.
+
+    Set PROXY_DEBUG_LOG environment variable to the log file path.
+    Logs are rotated daily.
+    """
+    global _debug_logger
+    log_path = os.environ.get("PROXY_DEBUG_LOG", "")
+    if not log_path or _debug_logger is not None:
+        return _debug_logger
+
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        logger = logging.getLogger("proxy_debug")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+
+        # Clear any existing handlers
+        try:
+            logger.handlers.clear()
+        except Exception:
+            for h in list(logger.handlers):
+                try:
+                    logger.removeHandler(h)
+                except Exception:
+                    pass
+
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=10 * 1024 * 1024,  # 10MB
+            backupCount=5,
+            encoding="utf-8",
+        )
+        handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+        _debug_logger = logger
+        return logger
+    except Exception:
+        return None
+
+
+def _sanitize_for_log(data: dict) -> dict:
+    """Remove sensitive fields from request/response data for logging."""
+    if not isinstance(data, dict):
+        return {}
+    # Deep copy to avoid modifying original
+    import copy
+
+    sanitized = copy.deepcopy(data)
+
+    # Remove common sensitive fields
+    sensitive_keys = {"api_key", "authorization", "x-api-key", "token", "password", "secret"}
+
+    def _redact(obj):
+        if isinstance(obj, dict):
+            for k in list(obj.keys()):
+                if isinstance(k, str) and any(s in k.lower() for s in sensitive_keys):
+                    obj[k] = "[REDACTED]"
+                else:
+                    obj[k] = _redact(obj[k])
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                obj[i] = _redact(item)
+        return obj
+
+    return _redact(sanitized)
+
+
+def log_request_response(request_data: dict, response_data: dict | None, error: Exception | None = None):
+    """Log a sanitized request/response pair if debug logging is enabled."""
+    logger = _init_debug_logger()
+    if logger is None:
+        return
+
+    try:
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "request": _sanitize_for_log(request_data),
+        }
+        if error:
+            entry["error"] = str(error)
+        elif response_data:
+            entry["response"] = _sanitize_for_log(response_data)
+
+        logger.debug(f"Request: {entry}")
+    except Exception:
+        pass
+
+
+# ------------------------------------------------
+# Graceful shutdown
+# ------------------------------------------------
+
+_shutting_down = threading.Event()
+
+
+def _signal_handler(signum: int, frame) -> None:
+    """Handle SIGINT/SIGTERM by saving stats and setting shutdown flag."""
+    if _shutting_down.is_set():
+        # Force exit on second signal
+        sys.exit(1)
+    _shutting_down.set()
+    print(f"\nReceived signal {signum}, shutting down gracefully...")
+    try:
+        save_persistent_stats(force=True)
+        print("Stats saved.")
+    except Exception as e:
+        print(f"Error saving stats: {e}")
+    sys.exit(0)
+
+
+def _register_signal_handlers():
+    """Register signal handlers for graceful shutdown."""
+    try:
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+    except (ValueError, AttributeError):
+        # May fail on Windows or if signals already set
+        pass
+
+
+def _atexit_handler():
+    """Last-resort save on exit."""
+    try:
+        save_persistent_stats(force=True)
+    except Exception:
+        pass
+
+
+atexit.register(_atexit_handler)
+
+# Silence common ASGI/HTTP server loggers (uvicorn, hypercorn, gunicorn)
+SILENCED_LOGGERS = (
+    "uvicorn.access",
+    "uvicorn.error",
+    "uvicorn",
+    "gunicorn.error",
+    "gunicorn.access",
+    "hypercorn.access",
+    "hypercorn.error",
+    "werkzeug",
+)
+try:
+    for name in SILENCED_LOGGERS:
+        lg = logging.getLogger(name)
+        try:
+            lg.handlers.clear()
+        except Exception:
+            for h in list(lg.handlers):
+                try:
+                    lg.removeHandler(h)
+                except Exception:
+                    pass
+        lg.addHandler(logging.NullHandler())
+        lg.setLevel(logging.CRITICAL)
+        lg.propagate = False
+        lg.disabled = True
+except Exception:
+    pass
+
+# Silence the root logger
+try:
+    root_logger = logging.getLogger()
+    for h in list(root_logger.handlers):
+        if isinstance(h, logging.StreamHandler):
+            root_logger.removeHandler(h)
+    root_logger.addHandler(logging.NullHandler())
+    root_logger.setLevel(logging.CRITICAL)
+except Exception:
+    pass
+from azure_llm_toolkit import AzureConfig, AzureLLMClient, CostEstimator, InMemoryCostTracker
+from dotenv import load_dotenv
+from litellm.proxy import proxy_cli
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+
+console = Console()
+
+
+# ------------------------------------------------
+# ENV
+# ------------------------------------------------
+
+load_dotenv()
+
+AZURE_API_KEY = os.environ.get("AZURE_API_KEY")
+AZURE_ENDPOINT = (
+    os.environ.get("AZURE_API_BASE")
+    or os.environ.get("AZURE_ENDPOINT")
+    or os.environ.get("AZURE_OPENAI_ENDPOINT")
+)
+AZURE_API_VERSION = os.environ.get("AZURE_API_VERSION", "2024-07-01-preview")
+
+if not AZURE_API_KEY or not AZURE_ENDPOINT:
+    raise RuntimeError(
+        "AZURE_API_KEY and AZURE_ENDPOINT (or AZURE_API_BASE/AZURE_OPENAI_ENDPOINT) must be set in .env"
+    )
+
+os.environ["AZURE_ENDPOINT"] = AZURE_ENDPOINT
+os.environ.setdefault("AZURE_API_VERSION", AZURE_API_VERSION)
+
+DEFAULT_MODEL = "Kimi-K2.5"
+DEFAULT_PORT = 4142
+
+parser = argparse.ArgumentParser(description="LiteLLM Anthropic Proxy")
+parser.add_argument(
+    "backend_model",
+    nargs="?",
+    default=DEFAULT_MODEL,
+    help=f"Azure deployment name (default: {DEFAULT_MODEL})",
+)
+parser.add_argument(
+    "--port",
+    type=int,
+    default=DEFAULT_PORT,
+    help=f"Listening port for proxy (default: {DEFAULT_PORT})",
+)
+args = parser.parse_args()
+
+backend_model = args.backend_model
+listen_port = args.port
+
+# ------------------------------------------------
+# Azure LLM Toolkit
+# ------------------------------------------------
+
+config = AzureConfig(
+    api_key=AZURE_API_KEY,
+    azure_endpoint=AZURE_ENDPOINT,
+    deployment_name=backend_model,
+)
+
+# Initialize cost estimator with user-provided pricing (per 1M tokens)
+cost_estimator = CostEstimator(currency="usd")
+import re
+
+# MODEL_PRICING_PATTERNS: tuples of (compiled_regex, pricing_dict). Patterns are
+# matched case-insensitively. Prices are expressed per 1M tokens.
+MODEL_PRICING_PATTERNS = [
+    (re.compile(r"^Kimi-?K?2\.5$", re.I), {"input": 0.60, "output": 3.00, "cached_input": 0.0}),
+    # gpt-5 variants: gpt-5, gpt-5.1, gpt-5.2, etc. Support optional suffixes like -codex and -codex-mini
+    (re.compile(r"^gpt-5(?:\.\d+)?-codex-mini$", re.I), {"input": 0.25, "output": 2.0, "cached_input": 0.03}),
+    (re.compile(r"^gpt-5(?:\.\d+)?-codex$", re.I), {"input": 1.25, "output": 10.0, "cached_input": 0.13}),
+    (re.compile(r"^gpt-5(?:\.\d+)?$", re.I), {"input": 1.25, "output": 10.0, "cached_input": 0.13}),
+]
+
+# Register canonical Kimi-K2.5 pricing for backward compatibility with exact name
+try:
+    cost_estimator.set_model_pricing(
+        "Kimi-K2.5",
+        input_price=0.60,
+        output_price=3.0,
+        cached_input_price=0.0,
+    )
+except Exception:
+    pass
+
+
+def _resolve_pricing_for_model(model_name: str):
+    """Return pricing dict (input/output/cached_input) for model_name using regex patterns.
+    Returns None if no match found.
+    """
+    if not model_name:
+        return None
+    for pat, pricing in MODEL_PRICING_PATTERNS:
+        try:
+            if pat.match(model_name):
+                return pricing
+        except Exception:
+            continue
+    return None
+
+
+def estimate_amount_for_model(model_name: str, tokens_input: int, tokens_output: int, tokens_cached_input: int = 0) -> float:
+    """Estimate amount (currency units) for the given token counts.
+
+    First try the CostEstimator (which may have exact-name registrations). If that
+    yields no usable result, fall back to regex-based pricing using
+    MODEL_PRICING_PATTERNS.
+    """
+    # Try toolkit estimator first (best-effort)
+    try:
+        amt = cost_estimator.estimate_cost(
+            model=model_name,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+            tokens_cached_input=tokens_cached_input,
+        )
+        # If estimator returned a non-zero amount, use it
+        if amt:
+            return float(amt)
+    except Exception:
+        pass
+
+    # Fallback: resolve pricing via regex patterns and compute manually
+    pricing = _resolve_pricing_for_model(model_name)
+    if not pricing:
+        return 0.0
+    input_price = pricing.get("input", 0.0)
+    output_price = pricing.get("output", 0.0)
+    cached_input_price = pricing.get("cached_input", 0.0)
+    # Prices are per 1M tokens
+    amt = (tokens_input * input_price + tokens_output * output_price + tokens_cached_input * cached_input_price) / 1_000_000.0
+    return float(amt)
+
+# Initialize cost tracker
+cost_tracker = InMemoryCostTracker()
+
+azure_client = AzureLLMClient(
+    config=config,
+    cost_tracker=cost_tracker,
+)
+
+# ------------------------------------------------
+# Runtime stats + persistent aggregates
+# ------------------------------------------------
+
+import json
+from datetime import UTC, timedelta
+
+# In-memory runtime stats (short-lived)
+stats = {
+    "requests": 0,
+    "errors": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "reasoning_tokens": 0,
+    "estimated_cost": 0.0,
+    "latencies": deque(maxlen=200),
+    # Track requests/tokens with timestamps for last-minute RPM/TPM calculation
+    "request_times": deque(maxlen=10000),  # (timestamp, tokens) tuples
+}
+
+stats_lock = threading.Lock()
+
+start_time = time.time()
+
+# Persistent stats configuration
+PERSISTENT_STATS_FILE = os.environ.get(
+    "PERSISTENT_STATS_FILE",
+    str(Path(__file__).parent / "persistent_stats.json"),
+)
+# Retention configuration (can be overridden with env vars)
+DAILY_RETENTION_DAYS = int(os.environ.get("PERSISTENT_DAILY_RETENTION_DAYS", "90"))
+WEEKLY_RETENTION_WEEKS = int(os.environ.get("PERSISTENT_WEEKLY_RETENTION_WEEKS", "52"))
+MONTHLY_RETENTION_MONTHS = int(os.environ.get("PERSISTENT_MONTHLY_RETENTION_MONTHS", "36"))
+
+# Persistent aggregated counters structure
+# Structure:
+# {
+#   "all_time": {counters...},
+#   "daily": {"YYYY-MM-DD": {counters...}},
+#   "weekly": {"YYYY-WWW": {counters...}},
+#   "monthly": {"YYYY-MM": {counters...}},
+#   "last_updated": ISO8601
+# }
+
+def _zero_counters():
+    return {
+        "requests": 0,
+        "errors": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        "estimated_cost": 0.0,
+        "last_latency": 0.0,
+        "start_time": None,
+        "avg_rpm": 0.0,
+        "avg_tpm": 0.0,
+    }
+
+persistent_lock = threading.Lock()
+_persistent_stats: dict | None = None
+_persistence_dirty = False
+
+
+def load_persistent_stats() -> dict:
+    global _persistent_stats
+    path = Path(PERSISTENT_STATS_FILE)
+    if not path.exists():
+        _persistent_stats = {
+            "all_time": _zero_counters(),
+            "daily": {},
+            "weekly": {},
+            "monthly": {},
+            "last_updated": datetime.now(UTC).isoformat(),
+        }
+        return _persistent_stats
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        # If file is corrupted or unreadable, start fresh but keep a backup
+        try:
+            backup = path.with_suffix(".corrupt")
+            path.replace(backup)
+        except Exception:
+            pass
+        _persistent_stats = {
+            "all_time": _zero_counters(),
+            "daily": {},
+            "weekly": {},
+            "monthly": {},
+            "last_updated": datetime.now(UTC).isoformat(),
+        }
+        return _persistent_stats
+
+    # Normalize loaded structure
+    all_time = data.get("all_time") or _zero_counters()
+    daily = data.get("daily") or {}
+    weekly = data.get("weekly") or {}
+    monthly = data.get("monthly") or {}
+
+    _persistent_stats = {
+        "all_time": {**_zero_counters(), **all_time},
+        "daily": {k: {**_zero_counters(), **v} for k, v in daily.items()},
+        "weekly": {k: {**_zero_counters(), **v} for k, v in weekly.items()},
+        "monthly": {k: {**_zero_counters(), **v} for k, v in monthly.items()},
+        "last_updated": data.get("last_updated") or datetime.now(UTC).isoformat(),
+    }
+    return _persistent_stats
+
+
+def _atomic_write(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    try:
+        tmp.replace(path)
+    except Exception:
+        # Fallback to rename
+        tmp.rename(path)
+
+
+def save_persistent_stats(force: bool = False) -> None:
+    """Persist aggregated stats to disk (debounced by background thread)."""
+    global _persistence_dirty
+    with persistent_lock:
+        if not force and not _persistence_dirty:
+            return
+        if _persistent_stats is None:
+            return
+        try:
+            path = Path(PERSISTENT_STATS_FILE)
+            _atomic_write(path, _persistent_stats)
+            _persistence_dirty = False
+        except Exception as e:
+            # Best-effort persistence; do not raise.
+            console.print(f"[yellow]Warning: failed to persist stats: {e}[/yellow]")
+
+
+def _prune_old_entries(now: datetime) -> None:
+    """Prune old daily/weekly/monthly buckets based on retention policies."""
+    if _persistent_stats is None:
+        return
+    cutoff_daily = (now - timedelta(days=DAILY_RETENTION_DAYS)).date()
+    cutoff_week = (now - timedelta(weeks=WEEKLY_RETENTION_WEEKS)).date()
+    cutoff_month = now.replace(day=1) - timedelta(days=30 * MONTHLY_RETENTION_MONTHS)
+
+    # Daily
+    keys_to_delete = []
+    for k in list(_persistent_stats["daily"].keys()):
+        try:
+            d = datetime.fromisoformat(k).date()
+        except Exception:
+            # If key not parseable, drop it to keep structure clean
+            keys_to_delete.append(k)
+            continue
+        if d < cutoff_daily:
+            keys_to_delete.append(k)
+    for k in keys_to_delete:
+        _persistent_stats["daily"].pop(k, None)
+
+    # Weekly (keys like YYYY-Www)
+    keys_to_delete = []
+    for k in list(_persistent_stats["weekly"].keys()):
+        try:
+            year_str, week_str = k.split("-W")
+            year = int(year_str)
+            week = int(week_str)
+            d = datetime.fromisocalendar(year, week, 1).date()
+        except Exception:
+            keys_to_delete.append(k)
+            continue
+        if d < cutoff_week:
+            keys_to_delete.append(k)
+    for k in keys_to_delete:
+        _persistent_stats["weekly"].pop(k, None)
+
+    # Monthly (keys like YYYY-MM)
+    keys_to_delete = []
+    for k in list(_persistent_stats["monthly"].keys()):
+        try:
+            year_str, month_str = k.split("-")
+            year = int(year_str)
+            month = int(month_str)
+            d = datetime(year, month, 1).date()
+        except Exception:
+            keys_to_delete.append(k)
+            continue
+        if d < cutoff_month.date():
+            keys_to_delete.append(k)
+    for k in keys_to_delete:
+        _persistent_stats["monthly"].pop(k, None)
+
+
+def _persistence_thread() -> None:
+    """Background thread that periodically flushes persistent stats to disk."""
+    while True:
+        try:
+            save_persistent_stats()
+        except Exception:
+            pass
+        time.sleep(5.0)
+
+
+def update_persistent_stats(
+    requests: int = 0,
+    errors: int = 0,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    estimated_cost: float = 0.0,
+    timestamp: datetime | None = None,
+) -> None:
+    """Add increments to persistent and rolling aggregates."""
+    global _persistence_dirty
+    if timestamp is None:
+        timestamp = datetime.now(UTC)
+    date_key = timestamp.date().isoformat()
+    iso = timestamp.isocalendar()
+    week_key = f"{iso[0]}-W{iso[1]:02d}"
+    month_key = f"{timestamp.year}-{timestamp.month:02d}"
+
+    with persistent_lock:
+        if _persistent_stats is None:
+            load_persistent_stats()
+        # All time
+        at = _persistent_stats["all_time"]
+        at["requests"] += int(requests)
+        at["errors"] += int(errors)
+        at["prompt_tokens"] += int(prompt_tokens)
+        at["completion_tokens"] += int(completion_tokens)
+        at["reasoning_tokens"] += int(reasoning_tokens)
+        at["estimated_cost"] += float(estimated_cost)
+        # Initialize start_time if missing and compute rolling averages
+        if at.get("start_time") is None:
+            at["start_time"] = timestamp.isoformat()
+        try:
+            elapsed_all = (timestamp - datetime.fromisoformat(at["start_time"])) if at.get("start_time") else timedelta(seconds=0)
+            minutes_all = max(elapsed_all.total_seconds() / 60, 1/60)
+            at["avg_rpm"] = at["requests"] / minutes_all
+            total_tokens_all = at["prompt_tokens"] + at["completion_tokens"]
+            at["avg_tpm"] = total_tokens_all / minutes_all
+        except Exception:
+            pass
+
+        # Daily
+        day = _persistent_stats["daily"].setdefault(date_key, _zero_counters())
+        day["requests"] += int(requests)
+        day["errors"] += int(errors)
+        day["prompt_tokens"] += int(prompt_tokens)
+        day["completion_tokens"] += int(completion_tokens)
+        day["reasoning_tokens"] += int(reasoning_tokens)
+        day["estimated_cost"] += float(estimated_cost)
+        # Update daily averages (RPM/TPM)
+        if day.get("start_time") is None:
+            day["start_time"] = timestamp.isoformat()
+        try:
+            elapsed_day = (timestamp - datetime.fromisoformat(day["start_time"])) if day.get("start_time") else timedelta(seconds=0)
+            minutes_day = max(elapsed_day.total_seconds() / 60, 1/60)
+            day["avg_rpm"] = day["requests"] / minutes_day
+            total_tokens_day = day["prompt_tokens"] + day["completion_tokens"]
+            day["avg_tpm"] = total_tokens_day / minutes_day
+        except Exception:
+            pass
+
+        # Weekly
+        week = _persistent_stats["weekly"].setdefault(week_key, _zero_counters())
+        week["requests"] += int(requests)
+        week["errors"] += int(errors)
+        week["prompt_tokens"] += int(prompt_tokens)
+        week["completion_tokens"] += int(completion_tokens)
+        week["reasoning_tokens"] += int(reasoning_tokens)
+        week["estimated_cost"] += float(estimated_cost)
+        if week.get("start_time") is None:
+            week["start_time"] = timestamp.isoformat()
+        try:
+            elapsed_week = (timestamp - datetime.fromisoformat(week["start_time"])) if week.get("start_time") else timedelta(seconds=0)
+            minutes_week = max(elapsed_week.total_seconds() / 60, 1/60)
+            week["avg_rpm"] = week["requests"] / minutes_week
+            total_tokens_week = week["prompt_tokens"] + week["completion_tokens"]
+            week["avg_tpm"] = total_tokens_week / minutes_week
+        except Exception:
+            pass
+
+        # Monthly
+        month = _persistent_stats["monthly"].setdefault(month_key, _zero_counters())
+        month["requests"] += int(requests)
+        month["errors"] += int(errors)
+        month["prompt_tokens"] += int(prompt_tokens)
+        month["completion_tokens"] += int(completion_tokens)
+        month["reasoning_tokens"] += int(reasoning_tokens)
+        month["estimated_cost"] += float(estimated_cost)
+        if month.get("start_time") is None:
+            month["start_time"] = timestamp.isoformat()
+        try:
+            elapsed_month = (timestamp - datetime.fromisoformat(month["start_time"])) if month.get("start_time") else timedelta(seconds=0)
+            minutes_month = max(elapsed_month.total_seconds() / 60, 1/60)
+            month["avg_rpm"] = month["requests"] / minutes_month
+            total_tokens_month = month["prompt_tokens"] + month["completion_tokens"]
+            month["avg_tpm"] = total_tokens_month / minutes_month
+        except Exception:
+            pass
+
+        _persistent_stats["last_updated"] = timestamp.isoformat()
+
+        # Prune older buckets (best-effort)
+        try:
+            _prune_old_entries(timestamp)
+        except Exception:
+            pass
+
+        _persistence_dirty = True
+
+
+def update_latency_in_persistent_stats(latency_seconds: float, timestamp: datetime | None = None) -> None:
+    """Update last_latency for all time buckets. Call this after each request to track average latency."""
+    global _persistence_dirty
+    if timestamp is None:
+        timestamp = datetime.now(UTC)
+    date_key = timestamp.date().isoformat()
+    iso = timestamp.isocalendar()
+    week_key = f"{iso[0]}-W{iso[1]:02d}"
+    month_key = f"{timestamp.year}-{timestamp.month:02d}"
+
+    with persistent_lock:
+        if _persistent_stats is None:
+            load_persistent_stats()
+
+        # Update last_latency for all time buckets
+        if _persistent_stats["all_time"].get("start_time"):
+            _persistent_stats["all_time"]["last_latency"] = latency_seconds
+
+        day = _persistent_stats["daily"].get(date_key)
+        if day and day.get("start_time"):
+            day["last_latency"] = latency_seconds
+
+        week = _persistent_stats["weekly"].get(week_key)
+        if week and week.get("start_time"):
+            week["last_latency"] = latency_seconds
+
+        month = _persistent_stats["monthly"].get(month_key)
+        if month and month.get("start_time"):
+            month["last_latency"] = latency_seconds
+
+        _persistence_dirty = True
+
+
+# Load persistent stats at startup and start background flusher
+load_persistent_stats()
+threading.Thread(target=_persistence_thread, daemon=True).start()
+
+# ------------------------------------------------
+# LiteLLM Callbacks
+# ------------------------------------------------
+
+
+def success_callback(kwargs, response, start_time, end_time):
+
+    # Normalize usage object: litellm/clients sometimes provide usage as a dict,
+    # other times as an object with attributes, and reasoning_tokens may be nested
+    # inside completion_tokens_details or output_tokens_details. Support all cases.
+    usage = {}
+    try:
+        if hasattr(response, "usage"):
+            usage = response.usage or {}
+        elif isinstance(response, dict):
+            usage = response.get("usage", {}) or {}
+        else:
+            # Fallback to mapping-style access if available
+            get_fn = getattr(response, "get", None)
+            if callable(get_fn):
+                usage = get_fn("usage", {}) or {}
+            else:
+                usage = {}
+    except Exception:
+        usage = {}
+
+    def _get_int(u, key):
+        try:
+            if isinstance(u, dict):
+                return int(u.get(key, 0) or 0)
+            return int(getattr(u, key, 0) or 0)
+        except Exception:
+            return 0
+
+    def _get_reasoning_from_usage(u):
+        if u is None:
+            return 0
+        # Direct top-level key
+        if isinstance(u, dict):
+            if "reasoning_tokens" in u:
+                return int(u.get("reasoning_tokens") or 0)
+            # Common nested locations
+            for nested_key in (
+                "completion_tokens_details",
+                "completion_tokens_detail",
+                "output_tokens_details",
+                "output_tokens_detail",
+            ):
+                nested = u.get(nested_key)
+                if isinstance(nested, dict) and "reasoning_tokens" in nested:
+                    return int(nested.get("reasoning_tokens") or 0)
+                if nested is not None and hasattr(nested, "reasoning_tokens"):
+                    return int(nested.reasoning_tokens or 0)
+            return 0
+        # Attr-style usage object
+        if hasattr(u, "reasoning_tokens"):
+            try:
+                return int(u.reasoning_tokens or 0)
+            except Exception:
+                return 0
+        for attr in ("completion_tokens_details", "output_tokens_details"):
+            nested = getattr(u, attr, None)
+            if nested is None:
+                continue
+            if isinstance(nested, dict) and "reasoning_tokens" in nested:
+                return int(nested.get("reasoning_tokens") or 0)
+            if hasattr(nested, "reasoning_tokens"):
+                try:
+                    return int(nested.reasoning_tokens or 0)
+                except Exception:
+                    return 0
+        return 0
+
+    prompt_tokens = _get_int(usage, "prompt_tokens")
+    completion_tokens = _get_int(usage, "completion_tokens")
+    reasoning_tokens = _get_reasoning_from_usage(usage)
+
+    # Calculate latency for this request
+    latency = end_time - start_time
+    now = time.time()
+    total_tokens = prompt_tokens + completion_tokens
+
+    # Update runtime counters under lock so dashboard sees latencies reliably
+    with stats_lock:
+        stats["requests"] += 1
+        stats["prompt_tokens"] += prompt_tokens
+        stats["completion_tokens"] += completion_tokens
+        stats["reasoning_tokens"] += reasoning_tokens
+        stats["latencies"].append(latency)
+        stats["request_times"].append((now, total_tokens))
+
+    # Update latency in persistent stats for all time buckets
+    try:
+        update_latency_in_persistent_stats(latency, timestamp=datetime.now(UTC))
+    except Exception:
+        pass
+
+    # Record cost/usage in a toolkit-compatible way. azure-llm-toolkit's
+    # InMemoryCostTracker exposes record_cost(...) not add_usage, so support
+    # both APIs for compatibility with other cost tracker implementations.
+    amount = 0.0
+    try:
+        # Compute estimated amount using a regex-aware estimator that supports gpt-5.x variants.
+        try:
+            amount = estimate_amount_for_model(
+                model_name=backend_model,
+                tokens_input=prompt_tokens,
+                tokens_output=completion_tokens,
+                tokens_cached_input=0,
+            )
+        except Exception:
+            amount = 0.0
+
+        if hasattr(cost_tracker, "add_usage"):
+            # Some cost tracker implementations provide add_usage(model, prompt_tokens, completion_tokens)
+            try:
+                cost_tracker.add_usage(
+                    model=backend_model,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+            except Exception:
+                pass
+        elif hasattr(cost_tracker, "record_cost"):
+            # Map to record_cost(category, model, tokens_input, tokens_output, tokens_cached_input, currency, amount, metadata)
+            try:
+                cost_tracker.record_cost(
+                    category="chat",
+                    model=backend_model,
+                    tokens_input=prompt_tokens,
+                    tokens_output=completion_tokens,
+                    tokens_cached_input=0,
+                    currency=getattr(cost_tracker, "currency", "usd"),
+                    amount=amount,
+                    metadata={"reasoning_tokens": reasoning_tokens},
+                )
+            except TypeError:
+                # Older record_cost signatures may differ; try positional fallback
+                try:
+                    cost_tracker.record_cost(
+                        "chat",
+                        backend_model,
+                        prompt_tokens,
+                        completion_tokens,
+                        0,
+                        getattr(cost_tracker, "currency", "usd"),
+                        amount,
+                        {"reasoning_tokens": reasoning_tokens},
+                    )
+                except Exception:
+                    # Best-effort: ignore cost tracking failure
+                    pass
+    except Exception:
+        # Do not let cost tracking break the proxy
+        pass
+
+    # Also update persistent aggregates (best-effort)
+    try:
+        update_persistent_stats(
+            requests=1,
+            errors=0,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            reasoning_tokens=reasoning_tokens,
+            estimated_cost=amount,
+            timestamp=datetime.now(UTC),
+        )
+    except Exception:
+        pass
+
+    # Log request/response if debug logging is enabled
+    try:
+        log_request_response(
+            request_data={
+                "model": backend_model,
+                "timestamp": now,
+                "tokens_in": prompt_tokens,
+                "tokens_out": completion_tokens,
+                "reasoning_tokens": reasoning_tokens,
+            },
+            response_data={
+                "latency": latency,
+                "estimated_cost": amount,
+                "usage": dict(usage) if isinstance(usage, dict) else {},
+            },
+        )
+    except Exception:
+        pass
+
+
+def failure_callback(kwargs, error, start_time, end_time):
+    stats["errors"] += 1
+
+    # Log failed request if debug logging is enabled
+    try:
+        log_request_response(
+            request_data={
+                "model": backend_model,
+                "timestamp": time.time(),
+            },
+            response_data=None,
+            error=error,
+        )
+    except Exception:
+        pass
+
+
+litellm.success_callback = [success_callback]
+litellm.failure_callback = [failure_callback]
+
+
+# ------------------------------------------------
+# LiteLLM Proxy Config
+# ------------------------------------------------
+
+
+def write_proxy_config() -> str:
+    config_yaml = f"""\
+model_list:
+  - model_name: claude-sonnet-4.6
+    litellm_params:
+      model: azure/{backend_model}
+      api_key: os.environ/AZURE_API_KEY
+      api_base: os.environ/AZURE_ENDPOINT
+      api_version: os.environ/AZURE_API_VERSION
+  - model_name: claude-haiku-4.5
+    litellm_params:
+      model: azure/{backend_model}
+      api_key: os.environ/AZURE_API_KEY
+      api_base: os.environ/AZURE_ENDPOINT
+      api_version: os.environ/AZURE_API_VERSION
+
+litellm_settings:
+  callbacks: ["prometheus"]
+"""
+    handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    handle.write(config_yaml)
+    handle.flush()
+    handle.close()
+    return handle.name
+
+
+def parse_prometheus_labels(raw_labels: str) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    if not raw_labels:
+        return labels
+
+    items: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    escape = False
+
+    for ch in raw_labels:
+        if escape:
+            current.append(ch)
+            escape = False
+            continue
+        if ch == "\\":
+            current.append(ch)
+            escape = True
+            continue
+        if ch == '"':
+            in_quotes = not in_quotes
+            current.append(ch)
+            continue
+        if ch == "," and not in_quotes:
+            items.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+
+    if current:
+        items.append("".join(current))
+
+    for item in items:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        labels[key] = value.strip().strip('"')
+
+    return labels
+
+
+def metric_is_relevant(
+    labels: dict[str, str], model_aliases: set[str], model_targets: set[str]
+) -> bool:
+    requested_model = labels.get("requested_model")
+    if requested_model and requested_model in model_aliases:
+        return True
+    model_label = labels.get("model")
+    if model_label and model_label in model_targets:
+        return True
+    return not requested_model and not model_label
+
+
+def refresh_stats_from_metrics() -> None:
+    metrics_url = f"http://localhost:{listen_port}/metrics/"
+    model_aliases = {"claude-sonnet-4.6", "claude-haiku-4.5"}
+    model_targets = {backend_model, f"azure/{backend_model}"}
+
+    totals = {
+        "requests": 0.0,
+        "errors": 0.0,
+        "prompt_tokens": 0.0,
+        "completion_tokens": 0.0,
+        "estimated_cost": 0.0,
+    }
+
+    try:
+        with urllib.request.urlopen(metrics_url, timeout=2) as response:
+            payload = response.read().decode("utf-8")
+    except (urllib.error.URLError, TimeoutError):
+        return
+
+    for line in payload.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        if " " not in line:
+            continue
+        metric_part, value_str = line.rsplit(" ", 1)
+        try:
+            value = float(value_str)
+        except ValueError:
+            continue
+
+        if "{" in metric_part:
+            name, label_chunk = metric_part.split("{", 1)
+            label_chunk = label_chunk.rstrip("}")
+            labels = parse_prometheus_labels(label_chunk)
+        else:
+            name = metric_part
+            labels = {}
+
+        if not metric_is_relevant(labels, model_aliases, model_targets):
+            continue
+
+        if name in {
+            "litellm_proxy_total_requests_metric",
+            "litellm_proxy_total_requests_metric_total",
+        }:
+            totals["requests"] += value
+        elif name in {
+            "litellm_proxy_failed_requests_metric",
+            "litellm_proxy_failed_requests_metric_total",
+        }:
+            totals["errors"] += value
+        elif name in {
+            "litellm_input_tokens_metric",
+            "litellm_input_tokens_metric_total",
+        }:
+            totals["prompt_tokens"] += value
+        elif name in {
+            "litellm_output_tokens_metric",
+            "litellm_output_tokens_metric_total",
+        }:
+            totals["completion_tokens"] += value
+        elif name in {"litellm_spend_metric", "litellm_spend_metric_total"}:
+            totals["estimated_cost"] += value
+
+    with stats_lock:
+        stats["requests"] = int(totals["requests"])
+        stats["errors"] = int(totals["errors"])
+        stats["prompt_tokens"] = int(totals["prompt_tokens"])
+        stats["completion_tokens"] = int(totals["completion_tokens"])
+        stats["estimated_cost"] = float(totals["estimated_cost"])
+
+
+def metrics_polling_loop() -> None:
+    while True:
+        refresh_stats_from_metrics()
+        time.sleep(1.0)
+
+
+# ------------------------------------------------
+# Dashboard
+# ------------------------------------------------
+
+
+def dashboard():
+
+    elapsed = time.time() - start_time
+
+    with stats_lock:
+        requests = stats["requests"]
+        errors = stats["errors"]
+        prompt_tokens = stats["prompt_tokens"]
+        completion_tokens = stats["completion_tokens"]
+        reasoning_tokens = stats["reasoning_tokens"]
+        estimated_cost = stats["estimated_cost"]
+        latencies = list(stats["latencies"])
+
+    # Capture a recent latency to surface even when latencies deque is empty
+    recent_latency = None
+    try:
+        with persistent_lock:
+            if _persistent_stats is None:
+                load_persistent_stats()
+            # last_latency is stored on all_time for best-effort display
+            recent_latency = (_persistent_stats or {}).get("all_time", {}).get("last_latency")
+    except Exception:
+        recent_latency = None
+
+    # Load persistent summaries for display (best-effort)
+    persistent_summary = {}
+    try:
+        with persistent_lock:
+            persistent_summary = _persistent_stats or {}
+    except Exception:
+        persistent_summary = {}
+
+    # Extract human-friendly totals
+    all_time = persistent_summary.get("all_time", {})
+    daily = persistent_summary.get("daily", {})
+    weekly = persistent_summary.get("weekly", {})
+    monthly = persistent_summary.get("monthly", {})
+
+    today_key = datetime.now(UTC).date().isoformat()
+    week_iso = datetime.now(UTC).isocalendar()
+    this_week_key = f"{week_iso[0]}-W{week_iso[1]:02d}"
+    this_month_key = f"{datetime.now(UTC).year}-{datetime.now(UTC).month:02d}"
+
+    today = daily.get(today_key, _zero_counters())
+    this_week = weekly.get(this_week_key, _zero_counters())
+    this_month = monthly.get(this_month_key, _zero_counters())
+    all_time_total = all_time or _zero_counters()
+
+    rpm = requests / (elapsed / 60) if elapsed else 0
+
+    total_tokens = prompt_tokens + completion_tokens
+    tpm = total_tokens / (elapsed / 60) if elapsed else 0
+
+    if latencies:
+        avg_latency = sum(latencies) / len(latencies)
+        avg_latency_display = f"{avg_latency * 1000:.1f} ms"
+    else:
+        # Fall back to last recorded latency from persistent stats if present
+        recent_latency = None
+        try:
+            with persistent_lock:
+                if _persistent_stats is None:
+                    load_persistent_stats()
+                recent_latency = (_persistent_stats or {}).get("all_time", {}).get("last_latency")
+        except Exception:
+            recent_latency = None
+        if recent_latency and recent_latency > 0:
+            avg_latency_display = f"{recent_latency * 1000:.1f} ms (last)"
+        else:
+            avg_latency_display = "n/a"
+
+    # Update last_latency in persistent all_time for next-run visibility
+    try:
+        with persistent_lock:
+            if _persistent_stats is None:
+                load_persistent_stats()
+            _persistent_stats["all_time"]["last_latency"] = avg_latency if latencies else (recent_latency or 0.0)
+            _persistence_dirty = True
+    except Exception:
+        pass
+
+    if estimated_cost:
+        total_cost = estimated_cost
+    else:
+        cost_summary = cost_tracker.get_summary()
+        if isinstance(cost_summary, dict):
+            total_cost = cost_summary.get("total_cost", 0.0)
+        else:
+            total_cost = cost_summary.total_cost
+
+    table = Table(title="LiteLLM → Azure Proxy Stats")
+
+    # Columns: Metric | Session | Today | This week | This month | All time
+    table.add_column("Metric")
+    table.add_column("Session", justify="right")
+    table.add_column("Today", justify="right")
+    table.add_column("This week", justify="right")
+    table.add_column("This month", justify="right")
+    table.add_column("All time", justify="right")
+
+    # Session-level cost (from in-memory cost tracker)
+    try:
+        session_cost = cost_tracker.get_total_cost() if hasattr(cost_tracker, "get_total_cost") else 0.0
+    except Exception:
+        session_cost = 0.0
+
+    today_cost = today.get("estimated_cost", 0.0)
+    week_cost = this_week.get("estimated_cost", 0.0)
+    month_cost = this_month.get("estimated_cost", 0.0)
+    all_time_cost = all_time_total.get("estimated_cost", 0.0)
+
+    # Session avg latency (numeric) and display
+    if latencies:
+        session_avg = sum(latencies) / len(latencies)
+        session_avg_display = f"{session_avg * 1000:.1f} ms"
+    else:
+        session_avg = None
+        # recent_latency may have been loaded earlier from persistent stats
+        session_avg_display = avg_latency_display
+
+    all_time_latency = all_time_total.get("last_latency", 0.0)
+    all_time_latency_display = f"{all_time_latency * 1000:.1f} ms" if all_time_latency else "n/a"
+
+    # Header row for backend model
+    table.add_row("Backend model", backend_model, "", "", "", "")
+
+    # Core metrics rows
+    table.add_row(
+        "Requests",
+        str(requests),
+        str(today.get("requests", 0)),
+        str(this_week.get("requests", 0)),
+        str(this_month.get("requests", 0)),
+        str(all_time_total.get("requests", 0)),
+    )
+
+    table.add_row(
+        "Prompt tokens",
+        f"{prompt_tokens:,}",
+        f"{today.get('prompt_tokens', 0):,}",
+        f"{this_week.get('prompt_tokens', 0):,}",
+        f"{this_month.get('prompt_tokens', 0):,}",
+        f"{all_time_total.get('prompt_tokens', 0):,}",
+    )
+
+    table.add_row(
+        "Completion tokens",
+        f"{completion_tokens:,}",
+        f"{today.get('completion_tokens', 0):,}",
+        f"{this_week.get('completion_tokens', 0):,}",
+        f"{this_month.get('completion_tokens', 0):,}",
+        f"{all_time_total.get('completion_tokens', 0):,}",
+    )
+
+    table.add_row(
+        "Reasoning tokens",
+        f"{reasoning_tokens:,}",
+        f"{today.get('reasoning_tokens', 0):,}",
+        f"{this_week.get('reasoning_tokens', 0):,}",
+        f"{this_month.get('reasoning_tokens', 0):,}",
+        f"{all_time_total.get('reasoning_tokens', 0):,}",
+    )
+
+    # Average RPM for each time period (stored in persistent stats)
+    session_avg_rpm = rpm  # calculated from current session
+    today_avg_rpm = today.get("avg_rpm", 0.0)
+    week_avg_rpm = this_week.get("avg_rpm", 0.0)
+    month_avg_rpm = this_month.get("avg_rpm", 0.0)
+    all_time_avg_rpm = all_time_total.get("avg_rpm", 0.0)
+
+    table.add_row(
+        "Avg RPM",
+        f"{session_avg_rpm:.2f}",
+        f"{today_avg_rpm:.2f}",
+        f"{week_avg_rpm:.2f}",
+        f"{month_avg_rpm:.2f}",
+        f"{all_time_avg_rpm:.2f}",
+    )
+
+    # Average TPM for each time period (stored in persistent stats)
+    session_avg_tpm = tpm  # calculated from current session
+    today_avg_tpm = today.get("avg_tpm", 0.0)
+    week_avg_tpm = this_week.get("avg_tpm", 0.0)
+    month_avg_tpm = this_month.get("avg_tpm", 0.0)
+    all_time_avg_tpm = all_time_total.get("avg_tpm", 0.0)
+
+    table.add_row(
+        "Avg TPM",
+        f"{session_avg_tpm:.2f}",
+        f"{today_avg_tpm:.2f}",
+        f"{week_avg_tpm:.2f}",
+        f"{month_avg_tpm:.2f}",
+        f"{all_time_avg_tpm:.2f}",
+    )
+
+    # Calculate last-minute RPM and TPM from request_times
+    now = time.time()
+    one_minute_ago = now - 60
+    with stats_lock:
+        request_times = list(stats["request_times"])
+
+    last_minute_requests = sum(1 for t, _ in request_times if t >= one_minute_ago)
+    last_minute_tokens = sum(tokens for t, tokens in request_times if t >= one_minute_ago)
+    # Since we're looking at exactly 1 minute window, RPM = count, TPM = token count
+    last_minute_rpm = last_minute_requests
+    last_minute_tpm = last_minute_tokens
+
+    table.add_row(
+        "RPM (last minute)",
+        f"{last_minute_rpm:.0f}",
+        "", "", "", "",
+    )
+
+    table.add_row(
+        "TPM (last minute)",
+        f"{last_minute_tpm:.0f}",
+        "", "", "", "",
+    )
+
+    # Average latency for each time period
+    today_avg_latency = today.get("last_latency", 0.0)
+    week_avg_latency = this_week.get("last_latency", 0.0)
+    month_avg_latency = this_month.get("last_latency", 0.0)
+    all_time_avg_latency = all_time_total.get("last_latency", 0.0)
+
+    today_latency_display = f"{today_avg_latency * 1000:.1f} ms" if today_avg_latency else "n/a"
+    week_latency_display = f"{week_avg_latency * 1000:.1f} ms" if week_avg_latency else "n/a"
+    month_latency_display = f"{month_avg_latency * 1000:.1f} ms" if month_avg_latency else "n/a"
+    all_time_latency_display = f"{all_time_avg_latency * 1000:.1f} ms" if all_time_avg_latency else "n/a"
+
+    table.add_row(
+        "Avg latency",
+        session_avg_display,
+        today_latency_display,
+        week_latency_display,
+        month_latency_display,
+        all_time_latency_display,
+    )
+
+    table.add_row(
+        "Estimated cost",
+        f"${session_cost:.4f}",
+        f"${today_cost:.4f}",
+        f"${week_cost:.4f}",
+        f"${month_cost:.4f}",
+        f"${all_time_cost:.4f}",
+    )
+
+    return Panel(table)
+
+
+def dashboard_loop():
+    try:
+        with Live(dashboard(), refresh_per_second=4, console=console) as live:
+            while True:
+                time.sleep(0.5)
+                try:
+                    live.update(dashboard())
+                except Exception as e:
+                    # Log error but keep dashboard running
+                    print(f"Dashboard update error: {e}")
+                    time.sleep(1.0)
+    except Exception as e:
+        print(f"Fatal dashboard error: {e}")
+        # Keep main thread alive even if dashboard crashes
+        while True:
+            time.sleep(60)
+
+
+# ------------------------------------------------
+# Run Proxy
+# ------------------------------------------------
+
+
+def run_proxy():
+
+    config_path = write_proxy_config()
+
+    # Build kwargs so we can attempt to pass uvicorn-related options (access_log/log_level)
+    # but fall back if the proxy_cli callback doesn't accept them.
+    base_kwargs = dict(
+        host="0.0.0.0",
+        port=int(listen_port),
+        api_base=None,
+        api_version=AZURE_API_VERSION,
+        model=None,
+        alias=None,
+        add_key=None,
+        headers=None,
+        save=False,
+        debug=False,
+        detailed_debug=False,
+        temperature=None,
+        max_tokens=None,
+        request_timeout=None,
+        drop_params=False,
+        add_function_to_prompt=False,
+        config=config_path,
+        max_budget=None,
+        telemetry=False,
+        test=False,
+        local=False,
+        num_workers=1,
+        test_async=False,
+        iam_token_db_auth=False,
+        num_requests=10,
+        use_queue=False,
+        health=False,
+        version=False,
+        run_gunicorn=False,
+        run_hypercorn=False,
+        ssl_keyfile_path=None,
+        ssl_certfile_path=None,
+        ciphers=None,
+        log_config=None,
+        use_prisma_db_push=False,
+        skip_server_startup=False,
+        keepalive_timeout=None,
+        max_requests_before_restart=None,
+    )
+
+    # Common uvicorn options we'd like to set to suppress access logs if supported.
+    extra_attempt = {"access_log": False, "log_level": "critical", "log_config": None}
+
+    # Try with the extra uvicorn-specific options first; fall back to base_kwargs on TypeError.
+    try:
+        proxy_cli.run_server.callback(**{**base_kwargs, **extra_attempt})
+        return
+    except TypeError:
+        try:
+            proxy_cli.run_server.callback(**base_kwargs)
+            return
+        except Exception:
+            # If both attempts fail, raise to surface the error
+            raise
+
+
+# ------------------------------------------------
+# Main
+# ------------------------------------------------
+
+if __name__ == "__main__":
+    # Check for headless mode (disable dashboard)
+    headless_mode = os.environ.get("PROXY_HEADLESS", "false").lower() in ("1", "true", "yes")
+
+    # Register signal handlers for graceful shutdown
+    _register_signal_handlers()
+
+    console.print(
+        f"\n[bold green]LiteLLM Anthropic Proxy[/bold green]\n"
+        f"Backend model: {backend_model}\n"
+        f"Listening: http://localhost:{listen_port}\n"
+        + ("[yellow]Headless mode (no dashboard)[/yellow]\n" if headless_mode else "")
+    )
+
+    t = threading.Thread(target=run_proxy, daemon=True)
+    t.start()
+
+    metrics_thread = threading.Thread(target=metrics_polling_loop, daemon=True)
+    metrics_thread.start()
+
+    if headless_mode:
+        # Keep main thread alive without dashboard
+        print("Running in headless mode. Press Ctrl+C to exit.")
+        while not _shutting_down.is_set():
+            time.sleep(1)
+    else:
+        dashboard_loop()
