@@ -33,6 +33,9 @@ try:
 except Exception:
     pass
 
+# Suppress LiteLLM banner on startup
+os.environ["LITELLM_LOG"] = "ERROR"
+
 # Aggressive logging suppression: monkey-patch StreamHandler.emit to drop access logs
 # This catches GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS access log lines from uvicorn and other ASGI servers.
 _original_streamhandler_emit = logging.StreamHandler.emit
@@ -863,6 +866,8 @@ def success_callback(kwargs, response, start_time, end_time):
         stats["reasoning_tokens"] += reasoning_tokens
         stats["latencies"].append(latency)
         stats["request_times"].append((now, total_tokens))
+        # Accumulate cost for session display
+        stats["estimated_cost"] = stats.get("estimated_cost", 0.0) + amount
 
     # Update latency in persistent stats for all time buckets
     try:
@@ -1232,14 +1237,19 @@ def dashboard():
     except Exception:
         pass
 
-    if estimated_cost:
-        total_cost = estimated_cost
-    else:
-        cost_summary = cost_tracker.get_summary()
-        if isinstance(cost_summary, dict):
-            total_cost = cost_summary.get("total_cost", 0.0)
-        else:
-            total_cost = cost_summary.total_cost
+    # Calculate session cost from accumulated estimated_cost in stats
+    # Sum up costs from persistent stats for this session
+    session_cost_total = estimated_cost  # This is from in-memory stats["estimated_cost"]
+    if not session_cost_total:
+        # Try cost tracker as fallback
+        try:
+            cost_summary = cost_tracker.get_summary()
+            if isinstance(cost_summary, dict):
+                session_cost_total = cost_summary.get("total_cost", 0.0)
+            else:
+                session_cost_total = getattr(cost_summary, "total_cost", 0.0)
+        except Exception:
+            session_cost_total = 0.0
 
     table = Table(title="LiteLLM → Azure Proxy Stats")
 
