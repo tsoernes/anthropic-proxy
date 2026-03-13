@@ -364,7 +364,18 @@ def estimate_amount_for_model(model_name: str, tokens_input: int, tokens_output:
     yields no usable result, fall back to regex-based pricing using
     MODEL_PRICING_PATTERNS.
     """
-    # Try toolkit estimator first (best-effort)
+    # Fallback first: resolve pricing via regex patterns (more reliable)
+    pricing = _resolve_pricing_for_model(model_name)
+    if pricing:
+        input_price = pricing.get("input", 0.0)
+        output_price = pricing.get("output", 0.0)
+        cached_input_price = pricing.get("cached_input", 0.0)
+        # Prices are per 1M tokens
+        amt = (tokens_input * input_price + tokens_output * output_price + tokens_cached_input * cached_input_price) / 1_000_000.0
+        if amt > 0:
+            return float(amt)
+
+    # Try toolkit estimator as secondary
     try:
         amt = cost_estimator.estimate_cost(
             model=model_name,
@@ -372,22 +383,20 @@ def estimate_amount_for_model(model_name: str, tokens_input: int, tokens_output:
             tokens_output=tokens_output,
             tokens_cached_input=tokens_cached_input,
         )
-        # If estimator returned a non-zero amount, use it
-        if amt:
+        if amt and amt > 0:
             return float(amt)
     except Exception:
         pass
 
-    # Fallback: resolve pricing via regex patterns and compute manually
-    pricing = _resolve_pricing_for_model(model_name)
-    if not pricing:
-        return 0.0
-    input_price = pricing.get("input", 0.0)
-    output_price = pricing.get("output", 0.0)
-    cached_input_price = pricing.get("cached_input", 0.0)
-    # Prices are per 1M tokens
-    amt = (tokens_input * input_price + tokens_output * output_price + tokens_cached_input * cached_input_price) / 1_000_000.0
-    return float(amt)
+    # Final fallback: basic calculation if we have pricing
+    if pricing:
+        input_price = pricing.get("input", 0.0)
+        output_price = pricing.get("output", 0.0)
+        cached_input_price = pricing.get("cached_input", 0.0)
+        amt = (tokens_input * input_price + tokens_output * output_price + tokens_cached_input * cached_input_price) / 1_000_000.0
+        return float(amt)
+
+    return 0.0
 
 # Initialize cost tracker
 cost_tracker = InMemoryCostTracker()
@@ -460,10 +469,12 @@ _persistent_stats: dict | None = None
 _persistence_dirty = False
 
 
-def load_persistent_stats() -> dict:
+def load_persistent_stats(verbose: bool = True) -> dict:
     global _persistent_stats
     path = Path(PERSISTENT_STATS_FILE)
     if not path.exists():
+        if verbose:
+            print(f"No persistent stats file found at {path}, starting fresh")
         _persistent_stats = {
             "all_time": _zero_counters(),
             "daily": {},
@@ -746,7 +757,20 @@ def update_latency_in_persistent_stats(latency_seconds: float, timestamp: dateti
 
 
 # Load persistent stats at startup and start background flusher
-load_persistent_stats()
+def _startup_load_stats():
+    path = Path(PERSISTENT_STATS_FILE)
+    if path.exists():
+        print(f"Loading stats from {path}...")
+        stats_data = load_persistent_stats(verbose=True)
+        all_time = stats_data.get("all_time", {})
+        total_requests = all_time.get("requests", 0)
+        total_cost = all_time.get("estimated_cost", 0.0)
+        print(f"Loaded: {total_requests} total requests, ${total_cost:.4f} total cost")
+    else:
+        print(f"No persisted stats found at {path}, starting fresh")
+        load_persistent_stats(verbose=False)
+
+_startup_load_stats()
 threading.Thread(target=_persistence_thread, daemon=True).start()
 
 # ------------------------------------------------
