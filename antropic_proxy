@@ -782,6 +782,8 @@ threading.Thread(target=_persistence_thread, daemon=True).start()
 
 
 def success_callback(kwargs, response, start_time, end_time):
+    # Debug: print when callback is triggered
+    print(f"[DEBUG] success_callback triggered: {type(response)}")
 
     # Normalize usage object: litellm/clients sometimes provide usage as a dict,
     # other times as an object with attributes, and reasoning_tokens may be nested
