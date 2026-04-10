@@ -11,6 +11,7 @@
 
 import argparse
 import atexit
+import inspect
 import logging
 import os
 import signal
@@ -33,12 +34,20 @@ try:
 except Exception:
     pass
 
-# Suppress LiteLLM banner on startup
+# Suppress LiteLLM banner/feedback box on startup
 os.environ["LITELLM_LOG"] = "ERROR"
+os.environ.setdefault("LITELLM_DONT_SHOW_FEEDBACK_BOX", "true")
+try:
+    from litellm.proxy.common_utils import banner as _litellm_banner
+
+    _litellm_banner.show_banner = lambda: None
+except Exception:
+    pass
 
 # Aggressive logging suppression: monkey-patch StreamHandler.emit to drop access logs
 # This catches GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS access log lines from uvicorn and other ASGI servers.
 _original_streamhandler_emit = logging.StreamHandler.emit
+
 
 def _silenced_emit(self, record):
     msg = record.getMessage() if record else ""
@@ -49,6 +58,7 @@ def _silenced_emit(self, record):
     if record.name in ("uvicorn.access", "uvicorn", "gunicorn.access", "hypercorn.access"):
         return
     return _original_streamhandler_emit(self, record)
+
 
 # Monkey-patch before uvicorn configures its loggers
 logging.StreamHandler.emit = _silenced_emit
@@ -114,9 +124,7 @@ def _init_debug_logger() -> logging.Logger | None:
             encoding="utf-8",
         )
         handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
@@ -274,19 +282,17 @@ load_dotenv()
 
 AZURE_API_KEY = os.environ.get("AZURE_API_KEY")
 AZURE_ENDPOINT = (
-    os.environ.get("AZURE_API_BASE")
-    or os.environ.get("AZURE_ENDPOINT")
-    or os.environ.get("AZURE_OPENAI_ENDPOINT")
+    os.environ.get("AZURE_API_BASE") or os.environ.get("AZURE_ENDPOINT") or os.environ.get("AZURE_OPENAI_ENDPOINT")
 )
 AZURE_API_VERSION = os.environ.get("AZURE_API_VERSION", "2024-07-01-preview")
+AZURE_RESPONSES_API_VERSION = os.environ.get("AZURE_RESPONSES_API_VERSION", "2025-04-01-preview")
 
 if not AZURE_API_KEY or not AZURE_ENDPOINT:
-    raise RuntimeError(
-        "AZURE_API_KEY and AZURE_ENDPOINT (or AZURE_API_BASE/AZURE_OPENAI_ENDPOINT) must be set in .env"
-    )
+    raise RuntimeError("AZURE_API_KEY and AZURE_ENDPOINT (or AZURE_API_BASE/AZURE_OPENAI_ENDPOINT) must be set in .env")
 
 os.environ["AZURE_ENDPOINT"] = AZURE_ENDPOINT
 os.environ.setdefault("AZURE_API_VERSION", AZURE_API_VERSION)
+os.environ.setdefault("AZURE_RESPONSES_API_VERSION", AZURE_RESPONSES_API_VERSION)
 
 DEFAULT_MODEL = "Kimi-K2.5"
 DEFAULT_PORT = 4142
@@ -309,6 +315,15 @@ args = parser.parse_args()
 backend_model = args.backend_model
 listen_port = args.port
 
+if "codex" in backend_model.lower():
+    try:
+        from litellm.llms.anthropic.experimental_pass_through.messages import handler as anthropic_messages_handler
+
+        anthropic_messages_handler._RESPONSES_API_PROVIDERS = frozenset({"openai", "azure"})
+        litellm.use_chat_completions_url_for_anthropic_messages = False
+    except Exception:
+        pass
+
 # ------------------------------------------------
 # Azure LLM Toolkit
 # ------------------------------------------------
@@ -329,6 +344,7 @@ MODEL_PRICING_PATTERNS = [
     (re.compile(r"^Kimi-?K?2\.5$", re.I), {"input": 0.60, "output": 3.00, "cached_input": 0.0}),
     # gpt-5 variants: gpt-5, gpt-5.1, gpt-5.2, etc. Support optional suffixes like -codex and -codex-mini
     (re.compile(r"^gpt-5(?:\.\d+)?-codex-mini$", re.I), {"input": 0.25, "output": 2.0, "cached_input": 0.03}),
+    (re.compile(r"^gpt-5(?:\.\d+)?-mini$", re.I), {"input": 0.25, "output": 2.0, "cached_input": 0.03}),
     (re.compile(r"^gpt-5(?:\.\d+)?-codex$", re.I), {"input": 1.25, "output": 10.0, "cached_input": 0.13}),
     (re.compile(r"^gpt-5(?:\.\d+)?$", re.I), {"input": 1.25, "output": 10.0, "cached_input": 0.13}),
 ]
@@ -360,28 +376,36 @@ def _resolve_pricing_for_model(model_name: str):
     return None
 
 
-def estimate_amount_for_model(model_name: str, tokens_input: int, tokens_output: int, tokens_cached_input: int = 0) -> float:
+def estimate_amount_for_model(
+    model_name: str, tokens_input: int, tokens_output: int, tokens_cached_input: int = 0
+) -> float:
     """Estimate amount (currency units) for the given token counts.
 
     First try the CostEstimator (which may have exact-name registrations). If that
     yields no usable result, fall back to regex-based pricing using
     MODEL_PRICING_PATTERNS.
     """
+    normalized_model = model_name.split("/")[-1] if model_name else model_name
+
     # Fallback first: resolve pricing via regex patterns (more reliable)
     pricing = _resolve_pricing_for_model(model_name)
+    if not pricing and normalized_model != model_name:
+        pricing = _resolve_pricing_for_model(normalized_model)
     if pricing:
         input_price = pricing.get("input", 0.0)
         output_price = pricing.get("output", 0.0)
         cached_input_price = pricing.get("cached_input", 0.0)
         # Prices are per 1M tokens
-        amt = (tokens_input * input_price + tokens_output * output_price + tokens_cached_input * cached_input_price) / 1_000_000.0
+        amt = (
+            tokens_input * input_price + tokens_output * output_price + tokens_cached_input * cached_input_price
+        ) / 1_000_000.0
         if amt > 0:
             return float(amt)
 
     # Try toolkit estimator as secondary
     try:
         amt = cost_estimator.estimate_cost(
-            model=model_name,
+            model=normalized_model or model_name,
             tokens_input=tokens_input,
             tokens_output=tokens_output,
             tokens_cached_input=tokens_cached_input,
@@ -396,10 +420,13 @@ def estimate_amount_for_model(model_name: str, tokens_input: int, tokens_output:
         input_price = pricing.get("input", 0.0)
         output_price = pricing.get("output", 0.0)
         cached_input_price = pricing.get("cached_input", 0.0)
-        amt = (tokens_input * input_price + tokens_output * output_price + tokens_cached_input * cached_input_price) / 1_000_000.0
+        amt = (
+            tokens_input * input_price + tokens_output * output_price + tokens_cached_input * cached_input_price
+        ) / 1_000_000.0
         return float(amt)
 
     return 0.0
+
 
 # Initialize cost tracker
 cost_tracker = InMemoryCostTracker()
@@ -453,6 +480,7 @@ MONTHLY_RETENTION_MONTHS = int(os.environ.get("PERSISTENT_MONTHLY_RETENTION_MONT
 #   "last_updated": ISO8601
 # }
 
+
 def _zero_counters():
     return {
         "requests": 0,
@@ -466,6 +494,7 @@ def _zero_counters():
         "avg_rpm": 0.0,
         "avg_tpm": 0.0,
     }
+
 
 persistent_lock = threading.Lock()
 _persistent_stats: dict | None = None
@@ -634,6 +663,17 @@ def update_persistent_stats(
     week_key = f"{iso[0]}-W{iso[1]:02d}"
     month_key = f"{timestamp.year}-{timestamp.month:02d}"
 
+    if estimated_cost == 0.0 and (prompt_tokens or completion_tokens):
+        try:
+            estimated_cost = estimate_amount_for_model(
+                model_name=backend_model,
+                tokens_input=int(prompt_tokens),
+                tokens_output=int(completion_tokens),
+                tokens_cached_input=0,
+            )
+        except Exception:
+            estimated_cost = 0.0
+
     with persistent_lock:
         if _persistent_stats is None:
             load_persistent_stats()
@@ -649,8 +689,10 @@ def update_persistent_stats(
         if at.get("start_time") is None:
             at["start_time"] = timestamp.isoformat()
         try:
-            elapsed_all = (timestamp - datetime.fromisoformat(at["start_time"])) if at.get("start_time") else timedelta(seconds=0)
-            minutes_all = max(elapsed_all.total_seconds() / 60, 1/60)
+            elapsed_all = (
+                (timestamp - datetime.fromisoformat(at["start_time"])) if at.get("start_time") else timedelta(seconds=0)
+            )
+            minutes_all = max(elapsed_all.total_seconds() / 60, 1 / 60)
             at["avg_rpm"] = at["requests"] / minutes_all
             total_tokens_all = at["prompt_tokens"] + at["completion_tokens"]
             at["avg_tpm"] = total_tokens_all / minutes_all
@@ -669,8 +711,12 @@ def update_persistent_stats(
         if day.get("start_time") is None:
             day["start_time"] = timestamp.isoformat()
         try:
-            elapsed_day = (timestamp - datetime.fromisoformat(day["start_time"])) if day.get("start_time") else timedelta(seconds=0)
-            minutes_day = max(elapsed_day.total_seconds() / 60, 1/60)
+            elapsed_day = (
+                (timestamp - datetime.fromisoformat(day["start_time"]))
+                if day.get("start_time")
+                else timedelta(seconds=0)
+            )
+            minutes_day = max(elapsed_day.total_seconds() / 60, 1 / 60)
             day["avg_rpm"] = day["requests"] / minutes_day
             total_tokens_day = day["prompt_tokens"] + day["completion_tokens"]
             day["avg_tpm"] = total_tokens_day / minutes_day
@@ -688,8 +734,12 @@ def update_persistent_stats(
         if week.get("start_time") is None:
             week["start_time"] = timestamp.isoformat()
         try:
-            elapsed_week = (timestamp - datetime.fromisoformat(week["start_time"])) if week.get("start_time") else timedelta(seconds=0)
-            minutes_week = max(elapsed_week.total_seconds() / 60, 1/60)
+            elapsed_week = (
+                (timestamp - datetime.fromisoformat(week["start_time"]))
+                if week.get("start_time")
+                else timedelta(seconds=0)
+            )
+            minutes_week = max(elapsed_week.total_seconds() / 60, 1 / 60)
             week["avg_rpm"] = week["requests"] / minutes_week
             total_tokens_week = week["prompt_tokens"] + week["completion_tokens"]
             week["avg_tpm"] = total_tokens_week / minutes_week
@@ -707,8 +757,12 @@ def update_persistent_stats(
         if month.get("start_time") is None:
             month["start_time"] = timestamp.isoformat()
         try:
-            elapsed_month = (timestamp - datetime.fromisoformat(month["start_time"])) if month.get("start_time") else timedelta(seconds=0)
-            minutes_month = max(elapsed_month.total_seconds() / 60, 1/60)
+            elapsed_month = (
+                (timestamp - datetime.fromisoformat(month["start_time"]))
+                if month.get("start_time")
+                else timedelta(seconds=0)
+            )
+            minutes_month = max(elapsed_month.total_seconds() / 60, 1 / 60)
             month["avg_rpm"] = month["requests"] / minutes_month
             total_tokens_month = month["prompt_tokens"] + month["completion_tokens"]
             month["avg_tpm"] = total_tokens_month / minutes_month
@@ -763,15 +817,35 @@ def update_latency_in_persistent_stats(latency_seconds: float, timestamp: dateti
 def _startup_load_stats():
     path = Path(PERSISTENT_STATS_FILE)
     if path.exists():
-        print(f"Loading stats from {path}...")
-        stats_data = load_persistent_stats(verbose=True)
-        all_time = stats_data.get("all_time", {})
-        total_requests = all_time.get("requests", 0)
-        total_cost = all_time.get("estimated_cost", 0.0)
-        print(f"Loaded: {total_requests} total requests, ${total_cost:.4f} total cost")
+        try:
+            print(f"Loading stats from {path}...")
+            stats_data = load_persistent_stats(verbose=True)
+            all_time = stats_data.get("all_time", {})
+            total_requests = all_time.get("requests", 0)
+            total_cost = all_time.get("estimated_cost", 0.0)
+            if total_cost == 0.0:
+                prompt_tokens = int(all_time.get("prompt_tokens", 0) or 0)
+                completion_tokens = int(all_time.get("completion_tokens", 0) or 0)
+                if prompt_tokens or completion_tokens:
+                    total_cost = estimate_amount_for_model(
+                        model_name=backend_model,
+                        tokens_input=prompt_tokens,
+                        tokens_output=completion_tokens,
+                        tokens_cached_input=0,
+                    )
+                    try:
+                        all_time["estimated_cost"] = float(total_cost)
+                        _persistence_dirty = True
+                        save_persistent_stats(force=True)
+                    except Exception:
+                        pass
+            print(f"Loaded: {total_requests} total requests, ${total_cost:.4f} total cost")
+        except Exception:
+            pass
     else:
         print(f"No persisted stats found at {path}, starting fresh")
         load_persistent_stats(verbose=False)
+
 
 _startup_load_stats()
 threading.Thread(target=_persistence_thread, daemon=True).start()
@@ -807,7 +881,15 @@ def success_callback(kwargs, response, start_time, end_time):
     def _get_int(u, key):
         try:
             if isinstance(u, dict):
+                if key == "prompt_tokens" and "input_tokens" in u:
+                    return int(u.get("input_tokens", 0) or 0)
+                if key == "completion_tokens" and "output_tokens" in u:
+                    return int(u.get("output_tokens", 0) or 0)
                 return int(u.get(key, 0) or 0)
+            if key == "prompt_tokens" and hasattr(u, "input_tokens"):
+                return int(getattr(u, "input_tokens", 0) or 0)
+            if key == "completion_tokens" and hasattr(u, "output_tokens"):
+                return int(getattr(u, "output_tokens", 0) or 0)
             return int(getattr(u, key, 0) or 0)
         except Exception:
             return 0
@@ -860,6 +942,33 @@ def success_callback(kwargs, response, start_time, end_time):
     now = time.time()
     total_tokens = prompt_tokens + completion_tokens
 
+    # Estimate amount early so it is available for in-memory and persistent stats
+    amount = 0.0
+    try:
+        amount = estimate_amount_for_model(
+            model_name=backend_model,
+            tokens_input=prompt_tokens,
+            tokens_output=completion_tokens,
+            tokens_cached_input=0,
+        )
+    except Exception:
+        amount = 0.0
+
+    if os.environ.get("PROXY_COST_DEBUG", "0") in ("1", "true", "yes"):
+        print(
+            "[COST_DEBUG]",
+            "backend_model=",
+            backend_model,
+            "prompt_tokens=",
+            prompt_tokens,
+            "completion_tokens=",
+            completion_tokens,
+            "usage=",
+            usage,
+            "amount=",
+            amount,
+        )
+
     # Update runtime counters under lock so dashboard sees latencies reliably
     with stats_lock:
         stats["requests"] += 1
@@ -880,19 +989,7 @@ def success_callback(kwargs, response, start_time, end_time):
     # Record cost/usage in a toolkit-compatible way. azure-llm-toolkit's
     # InMemoryCostTracker exposes record_cost(...) not add_usage, so support
     # both APIs for compatibility with other cost tracker implementations.
-    amount = 0.0
     try:
-        # Compute estimated amount using a regex-aware estimator that supports gpt-5.x variants.
-        try:
-            amount = estimate_amount_for_model(
-                model_name=backend_model,
-                tokens_input=prompt_tokens,
-                tokens_output=completion_tokens,
-                tokens_cached_input=0,
-            )
-        except Exception:
-            amount = 0.0
-
         if hasattr(cost_tracker, "add_usage"):
             # Some cost tracker implementations provide add_usage(model, prompt_tokens, completion_tokens)
             try:
@@ -997,20 +1094,22 @@ litellm.failure_callback = [failure_callback]
 
 
 def write_proxy_config() -> str:
+    model_prefix = "azure/responses/" if "codex" in backend_model.lower() else "azure/"
+    api_version_env = "AZURE_RESPONSES_API_VERSION" if "codex" in backend_model.lower() else "AZURE_API_VERSION"
     config_yaml = f"""\
 model_list:
   - model_name: claude-sonnet-4.6
     litellm_params:
-      model: azure/{backend_model}
+      model: {model_prefix}{backend_model}
       api_key: os.environ/AZURE_API_KEY
       api_base: os.environ/AZURE_ENDPOINT
-      api_version: os.environ/AZURE_API_VERSION
+      api_version: os.environ/{api_version_env}
   - model_name: claude-haiku-4.5
     litellm_params:
-      model: azure/{backend_model}
+      model: {model_prefix}{backend_model}
       api_key: os.environ/AZURE_API_KEY
       api_base: os.environ/AZURE_ENDPOINT
-      api_version: os.environ/AZURE_API_VERSION
+      api_version: os.environ/{api_version_env}
 
 litellm_settings:
   callbacks: ["prometheus"]
@@ -1063,9 +1162,7 @@ def parse_prometheus_labels(raw_labels: str) -> dict[str, str]:
     return labels
 
 
-def metric_is_relevant(
-    labels: dict[str, str], model_aliases: set[str], model_targets: set[str]
-) -> bool:
+def metric_is_relevant(labels: dict[str, str], model_aliases: set[str], model_targets: set[str]) -> bool:
     requested_model = labels.get("requested_model")
     if requested_model and requested_model in model_aliases:
         return True
@@ -1075,10 +1172,19 @@ def metric_is_relevant(
     return not requested_model and not model_label
 
 
+_metrics_last_totals: dict | None = None
+_metrics_samples: deque = deque(maxlen=120)
+
+
 def refresh_stats_from_metrics() -> None:
     metrics_url = f"http://localhost:{listen_port}/metrics/"
     model_aliases = {"claude-sonnet-4.6", "claude-haiku-4.5"}
-    model_targets = {backend_model, f"azure/{backend_model}"}
+    model_targets = {
+        backend_model,
+        f"azure/{backend_model}",
+        f"responses/{backend_model}",
+        f"azure/responses/{backend_model}",
+    }
 
     totals = {
         "requests": 0.0,
@@ -1144,7 +1250,68 @@ def refresh_stats_from_metrics() -> None:
         stats["errors"] = int(totals["errors"])
         stats["prompt_tokens"] = int(totals["prompt_tokens"])
         stats["completion_tokens"] = int(totals["completion_tokens"])
-        stats["estimated_cost"] = float(totals["estimated_cost"])
+        estimated_cost = float(totals["estimated_cost"])
+        if estimated_cost == 0.0 and (totals["prompt_tokens"] > 0 or totals["completion_tokens"] > 0):
+            estimated_cost = estimate_amount_for_model(
+                model_name=backend_model,
+                tokens_input=int(totals["prompt_tokens"]),
+                tokens_output=int(totals["completion_tokens"]),
+                tokens_cached_input=0,
+            )
+        stats["estimated_cost"] = float(estimated_cost)
+        if os.environ.get("PROXY_COST_DEBUG", "0") in ("1", "true", "yes"):
+            print(
+                "[COST_DEBUG][metrics]",
+                "requests=",
+                int(totals["requests"]),
+                "prompt_tokens=",
+                int(totals["prompt_tokens"]),
+                "completion_tokens=",
+                int(totals["completion_tokens"]),
+                "estimated_cost=",
+                float(estimated_cost),
+            )
+
+    global _metrics_last_totals
+    current_totals = {
+        "requests": float(totals["requests"]),
+        "errors": float(totals["errors"]),
+        "prompt_tokens": float(totals["prompt_tokens"]),
+        "completion_tokens": float(totals["completion_tokens"]),
+        "estimated_cost": float(estimated_cost),
+    }
+    try:
+        _metrics_samples.append(
+            (
+                time.time(),
+                float(totals["requests"]),
+                float(totals["prompt_tokens"]) + float(totals["completion_tokens"]),
+            )
+        )
+    except Exception:
+        pass
+
+    if _metrics_last_totals is None:
+        _metrics_last_totals = current_totals
+        return
+
+    if any(current_totals[k] < _metrics_last_totals.get(k, 0.0) for k in current_totals):
+        _metrics_last_totals = current_totals
+        return
+
+    deltas = {k: current_totals[k] - _metrics_last_totals.get(k, 0.0) for k in current_totals}
+    _metrics_last_totals = current_totals
+
+    if any(v > 0 for v in deltas.values()):
+        update_persistent_stats(
+            requests=int(max(deltas["requests"], 0.0)),
+            errors=int(max(deltas["errors"], 0.0)),
+            prompt_tokens=int(max(deltas["prompt_tokens"], 0.0)),
+            completion_tokens=int(max(deltas["completion_tokens"], 0.0)),
+            reasoning_tokens=0,
+            estimated_cost=float(max(deltas["estimated_cost"], 0.0)),
+            timestamp=datetime.now(UTC),
+        )
 
 
 def metrics_polling_loop() -> None:
@@ -1263,11 +1430,8 @@ def dashboard():
     table.add_column("This month", justify="right")
     table.add_column("All time", justify="right")
 
-    # Session-level cost (from in-memory cost tracker)
-    try:
-        session_cost = cost_tracker.get_total_cost() if hasattr(cost_tracker, "get_total_cost") else 0.0
-    except Exception:
-        session_cost = 0.0
+    # Session-level cost (from in-memory stats / metrics fallback)
+    session_cost = session_cost_total
 
     today_cost = today.get("estimated_cost", 0.0)
     week_cost = this_week.get("estimated_cost", 0.0)
@@ -1361,11 +1525,27 @@ def dashboard():
     # Calculate last-minute RPM and TPM from request_times
     now = time.time()
     one_minute_ago = now - 60
-    with stats_lock:
-        request_times = list(stats["request_times"])
+    last_minute_requests = 0
+    last_minute_tokens = 0
 
-    last_minute_requests = sum(1 for t, _ in request_times if t >= one_minute_ago)
-    last_minute_tokens = sum(tokens for t, tokens in request_times if t >= one_minute_ago)
+    try:
+        samples = list(_metrics_samples)
+    except Exception:
+        samples = []
+
+    if samples:
+        recent = [s for s in samples if s[0] >= one_minute_ago]
+        if len(recent) >= 2:
+            oldest = recent[0]
+            newest = recent[-1]
+            last_minute_requests = max(int(newest[1] - oldest[1]), 0)
+            last_minute_tokens = max(int(newest[2] - oldest[2]), 0)
+
+    if last_minute_requests == 0 and last_minute_tokens == 0:
+        with stats_lock:
+            request_times = list(stats["request_times"])
+        last_minute_requests = sum(1 for t, _ in request_times if t >= one_minute_ago)
+        last_minute_tokens = sum(tokens for t, tokens in request_times if t >= one_minute_ago)
     # Since we're looking at exactly 1 minute window, RPM = count, TPM = token count
     last_minute_rpm = last_minute_requests
     last_minute_tpm = last_minute_tokens
@@ -1373,13 +1553,19 @@ def dashboard():
     table.add_row(
         "RPM (last minute)",
         f"{last_minute_rpm:.0f}",
-        "", "", "", "",
+        "",
+        "",
+        "",
+        "",
     )
 
     table.add_row(
         "TPM (last minute)",
         f"{last_minute_tpm:.0f}",
-        "", "", "", "",
+        "",
+        "",
+        "",
+        "",
     )
 
     # Average latency for each time period
@@ -1437,6 +1623,24 @@ def dashboard_loop():
 # ------------------------------------------------
 
 
+def _call_run_server_with_supported_kwargs(kwargs: dict):
+    """Call LiteLLM run_server with only supported kwargs and safe defaults."""
+    sig = inspect.signature(proxy_cli.run_server.callback)
+    accepted = {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+    # Fill required parameters if they exist and are missing
+    for name, param in sig.parameters.items():
+        if name in accepted:
+            continue
+        if param.default is not inspect._empty:
+            accepted[name] = param.default
+            continue
+        if name in ("setup", "enforce_prisma_migration_check"):
+            accepted[name] = False
+
+    return proxy_cli.run_server.callback(**accepted)
+
+
 def run_proxy():
 
     config_path = write_proxy_config()
@@ -1487,17 +1691,8 @@ def run_proxy():
     # Common uvicorn options we'd like to set to suppress access logs if supported.
     extra_attempt = {"access_log": False, "log_level": "critical", "log_config": None}
 
-    # Try with the extra uvicorn-specific options first; fall back to base_kwargs on TypeError.
-    try:
-        proxy_cli.run_server.callback(**{**base_kwargs, **extra_attempt})
-        return
-    except TypeError:
-        try:
-            proxy_cli.run_server.callback(**base_kwargs)
-            return
-        except Exception:
-            # If both attempts fail, raise to surface the error
-            raise
+    # Call run_server with only supported kwargs (varies across LiteLLM versions).
+    _call_run_server_with_supported_kwargs({**base_kwargs, **extra_attempt})
 
 
 # ------------------------------------------------
